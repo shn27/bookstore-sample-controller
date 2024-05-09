@@ -160,3 +160,10 @@ https://github.com/kubernetes/kubernetes/blob/master/staging/src/k8s.io/sample-c
 Code changes are made in that location, merged into k8s.io/kubernetes and
 later synced here.
 
+### TODO
+
+1. Service part
+
+### Issue 
+
+1. Getting to many logs. Should get call just a single time for creating a deployment but getting many calls.
