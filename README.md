@@ -33,4 +33,8 @@ go build .
 
 `kc port-forward service/bookstore 3000`
 
-
+<h3> Test </h3>
+Use <i>POSTMAN</i> <br>
+<i>USERNAME</i> : admin <br>
+<i>PASSWORD</i> : 1234<br>
+https://github.com/shn27/BookStoreApi-Go <br>
