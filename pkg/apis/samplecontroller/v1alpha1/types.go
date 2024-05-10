@@ -59,6 +59,6 @@ type BookStoreList struct {
 func (bookstore *BookStore) GetSelectorLabels() map[string]string {
 	return map[string]string{
 		"app":        bookstore.Name + "-app",
-		"controller": bookstore.Name + "-customController1",
+		"controller": bookstore.Name + "-customController",
 	}
 }

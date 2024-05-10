@@ -19,7 +19,8 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	v1 "k8s.io/client-go/listers/core/v1"
 	_ "log"
 	_ "log/slog"
 	_ "os"
@@ -34,6 +35,7 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	appsinformers "k8s.io/client-go/informers/apps/v1"
+	v12 "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -78,6 +80,8 @@ type Controller struct {
 	deploymentsSynced cache.InformerSynced
 	bookstoreLister   listers.BookStoreLister
 	bookstoreSynced   cache.InformerSynced
+	serviceLister     v1.ServiceLister
+	serviceSynced     cache.InformerSynced
 
 	// workqueue is a rate limited work queue. This is used to queue work to be
 	// processed instead of performing it as soon as a change happens. This
@@ -96,7 +100,9 @@ func NewController(
 	kubeclientset kubernetes.Interface,
 	sampleclientset clientset.Interface,
 	deploymentInformer appsinformers.DeploymentInformer,
-	bookstoreInformer informers.BookStoreInformer) *Controller {
+	bookstoreInformer informers.BookStoreInformer,
+	serviceInformer v12.ServiceInformer,
+) *Controller {
 	logger := klog.FromContext(ctx)
 
 	// Create event broadcaster
@@ -121,6 +127,8 @@ func NewController(
 		deploymentsSynced: deploymentInformer.Informer().HasSynced,
 		bookstoreLister:   bookstoreInformer.Lister(), //bookstoreInformer.Lister(),
 		bookstoreSynced:   bookstoreInformer.Informer().HasSynced,
+		serviceLister:     serviceInformer.Lister(),
+		serviceSynced:     serviceInformer.Informer().HasSynced,
 		workqueue:         workqueue.NewTypedRateLimitingQueue(ratelimiter),
 		recorder:          recorder,
 	}
@@ -146,6 +154,22 @@ func NewController(
 			newDepl := new.(*appsv1.Deployment)
 			oldDepl := old.(*appsv1.Deployment)
 			if newDepl.ResourceVersion == oldDepl.ResourceVersion {
+				// Periodic resync will send update events for all known Deployments.
+				// Two different versions of the same Deployment will always have different RVs.
+				return
+			}
+			controller.handleObject(new)
+		},
+		DeleteFunc: controller.handleObject,
+	})
+
+	//Set up an event handler for when Service resources change.
+	serviceInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: controller.handleObject,
+		UpdateFunc: func(old, new interface{}) {
+			newServ := new.(*corev1.Service)
+			oldServ := old.(*corev1.Service)
+			if newServ.ResourceVersion == oldServ.ResourceVersion {
 				// Periodic resync will send update events for all known Deployments.
 				// Two different versions of the same Deployment will always have different RVs.
 				return
@@ -245,9 +269,6 @@ func (c *Controller) processNextWorkItem(ctx context.Context) bool {
 func (c *Controller) syncHandler(ctx context.Context, key string) error {
 	// Convert the namespace/name string into a distinct namespace and name
 	logger := klog.LoggerWithValues(klog.FromContext(ctx), "resourceName", key)
-
-	log.Println("kaka resourceName is ", key)
-
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
 		utilruntime.HandleError(fmt.Errorf("invalid resource key: %s", key))
@@ -297,12 +318,42 @@ func (c *Controller) syncHandler(ctx context.Context, key string) error {
 		c.recorder.Event(bookstore, corev1.EventTypeWarning, ErrResourceExists, msg)
 		return fmt.Errorf("%s", msg)
 	}
+	//service Check
+	serviceName := bookstore.Spec.DeploymentName // service name same as deployment name
+	if serviceName == "" {
+		// We choose to absorb the error here as the worker would requeue the
+		// resource otherwise. Instead, the next time the resource is updated
+		// the resource will be queued again.
+		utilruntime.HandleError(fmt.Errorf("%s: deployment name must be specified", key))
+		return nil
+	}
+
+	// Get the deployment with the name specified in BookStore.spec
+	service, err := c.serviceLister.Services(bookstore.Namespace).Get(serviceName)
+	// If the resource doesn't exist, we'll create it
+	if errors.IsNotFound(err) {
+		service, err = c.kubeclientset.CoreV1().Services(bookstore.Namespace).Create(context.TODO(), newService(bookstore), metav1.CreateOptions{})
+	}
+
+	// If an error occurs during Get/Create, we'll requeue the item so we can
+	// attempt processing again later. This could have been caused by a
+	// temporary network failure, or any other transient reason.
+	if err != nil {
+		return err
+	}
+
+	// If the service is not controlled by this BookStore resource, we should log
+	// a warning to the event recorder and return error msg.
+	if !metav1.IsControlledBy(service, bookstore) {
+		msg := fmt.Sprintf(MessageResourceExists, deployment.Name)
+		c.recorder.Event(bookstore, corev1.EventTypeWarning, ErrResourceExists, msg)
+		return fmt.Errorf("%s", msg)
+	}
+	// Service check end
 
 	// If this number of the replicas on the BookStore resource is specified, and the
 	// number does not equal the current desired replicas on the Deployment, we
 	// should update the Deployment resource.
-
-	log.Printf("spec ", *bookstore.Spec.Replicas, "dep", *deployment.Spec.Replicas)
 
 	if bookstore.Spec.Replicas != nil && *bookstore.Spec.Replicas != *deployment.Spec.Replicas {
 		logger.V(4).Info("Update deployment resource", "currentReplicas", *bookstore.Spec.Replicas, "desiredReplicas", *deployment.Spec.Replicas)
@@ -399,19 +450,13 @@ func (c *Controller) handleObject(obj interface{}) {
 // the appropriate OwnerReferences on the resource so handleObject can discover
 // the BookStore resource that 'owns' it.
 func newDeployment(bookstore *samplev1alpha1.BookStore) *appsv1.Deployment {
-
-	log.Println("Creating a new deployment", "namespace", bookstore.Namespace, "name", bookstore.Name)
-
-	labels := map[string]string{
-		"app":        "book-store",   // get it from spec TODO
-		"controller": bookstore.Name, // get it from spec TODO
-	}
+	labels := bookstore.GetSelectorLabels()
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      bookstore.Spec.DeploymentName,
 			Namespace: bookstore.Namespace,
 			OwnerReferences: []metav1.OwnerReference{
-				*metav1.NewControllerRef(bookstore, samplev1alpha1.SchemeGroupVersion.WithKind("BookStore")),
+				*metav1.NewControllerRef(bookstore, samplev1alpha1.SchemeGroupVersion.WithKind("BookStore")), // TODO
 			},
 		},
 		Spec: appsv1.DeploymentSpec{
@@ -426,10 +471,38 @@ func newDeployment(bookstore *samplev1alpha1.BookStore) *appsv1.Deployment {
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{
 						{
-							Name:  "book-store",           // get it from spec TODO
-							Image: "shn27/book-store:4.0", // get it from spec TODO
+							Name:  bookstore.Spec.DeploymentName,
+							Image: bookstore.Spec.DeploymentImageName + ":" + bookstore.Spec.DeploymentImageTag,
+							Ports: []corev1.ContainerPort{
+								{
+									ContainerPort: bookstore.Spec.ContainerPort,
+								},
+							},
 						},
 					},
+				},
+			},
+		},
+	}
+}
+
+func newService(bookstore *samplev1alpha1.BookStore) *corev1.Service {
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      bookstore.Spec.DeploymentName,
+			Namespace: bookstore.Namespace,
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(bookstore, samplev1alpha1.SchemeGroupVersion.WithKind("BookStore")), // TODO
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: bookstore.GetSelectorLabels(),
+			Type:     corev1.ServiceTypeLoadBalancer,
+			Ports: []corev1.ServicePort{
+				{
+					Port:       bookstore.Spec.ContainerPort,
+					TargetPort: intstr.FromInt(int(bookstore.Spec.ContainerPort)),
+					NodePort:   30000,
 				},
 			},
 		},
